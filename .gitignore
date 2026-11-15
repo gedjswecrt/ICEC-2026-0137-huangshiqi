@@ -1,0 +1,13 @@
+# 本地工作区/临时文件，不纳入版本管理
+.workbuddy/
+_备选方案/
+待办清单.md
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 系统文件
+desktop.ini
+Thumbs.db
+.DS_Store
