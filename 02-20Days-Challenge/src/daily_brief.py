@@ -29,7 +29,7 @@ LOGS = os.path.join(BASE, "process_logs")
 os.makedirs(OUT, exist_ok=True)
 os.makedirs(LOGS, exist_ok=True)
 
-VERSION = "v0.2"
+VERSION = "v0.3"
 WEEK_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
@@ -47,7 +47,26 @@ WEATHER_CN = {"sunny": "晴", "clear": "晴", "partly cloudy": "多云", "cloudy
               "overcast": "阴", "mist": "薄雾", "fog": "雾", "haze": "霾", "smoke": "霾",
               "light drizzle": "毛毛雨", "light rain": "小雨", "moderate rain": "中雨",
               "heavy rain": "大雨", "light snow": "小雪", "thundery outbreaks": "雷雨",
-              "patchy rain possible": "可能有雨", "light showers": "零星阵雨"}
+              "patchy rain possible": "可能有雨", "patchy rain nearby": "局部零星小雨",
+              "light showers": "零星阵雨", "patchy light rain": "局部小雨",
+              "light rain shower": "零星小雨", "moderate or heavy rain shower": "阵雨",
+              "thundery showers possible": "可能有雷阵雨", "patchy light drizzle": "局部毛毛雨",
+              "partly cloudy night": "夜间多云", "clear night": "夜间晴"}
+# 兜底规则：查不到的英文描述按关键词粗译，避免英文原句直接出现在早报上
+WEATHER_FALLBACK = [("rain", "有雨"), ("drizzle", "毛毛雨"), ("snow", "有雪"),
+                    ("thunder", "雷雨"), ("shower", "阵雨"), ("cloud", "多云"),
+                    ("fog", "有雾"), ("mist", "薄雾"), ("sunny", "晴"), ("clear", "晴")]
+
+
+def weather_cn(desc_en):
+    """三段式翻译：精确匹配 → 关键词兜底 → 原文（并标记未译，便于日志统计覆盖盲区）"""
+    key = desc_en.strip().lower()
+    if key in WEATHER_CN:
+        return WEATHER_CN[key], False
+    for kw, cn in WEATHER_FALLBACK:
+        if kw in key:
+            return cn, False
+    return desc_en, True
 
 
 def fetch_weather():
@@ -65,9 +84,13 @@ def fetch_weather():
         cost_ms = int((time.perf_counter() - t0) * 1000)
         cur = raw["current_condition"][0]
         desc_en = cur["weatherDesc"][0]["value"].strip()
-        desc = (f"{WEATHER_CN.get(desc_en.lower(), desc_en)}，"
+        desc_cn, untranslated = weather_cn(desc_en)
+        desc = (f"{desc_cn}，"
                 f"{cur['temp_C']}°C，湿度{cur['humidity']}%，"
                 f"风速{cur['windspeedKmph']}km/h")
+        if untranslated:
+            # 记录翻译盲区，供后续补全映射表（不视为运行错误）
+            desc += f"（原文: {desc_en}）"
         return desc, cost_ms, "wttr.in"
     except Exception as e:
         errors.append(f"wttr.in: {e}")
@@ -147,7 +170,22 @@ def main():
         step("天气API", False, str(e), cost)
         log["errors"].append(f"weather: {e}")
 
-    # 4. 生成 HTML
+    # 4. 校园资讯/生活贴士（按日期轮换，同一天固定、每天不同；响应用户反馈 U01/U02）
+    t0 = time.perf_counter()
+    tips_today = []
+    try:
+        tips_all = [t for t in load_csv(os.path.join(DATA, "tips.csv"))
+                    if (t.get("内容") or "").strip()]
+        if tips_all:
+            offset = today.timetuple().tm_yday  # 一年中的第几天
+            tips_today = [tips_all[(offset + i) % len(tips_all)] for i in range(min(3, len(tips_all)))]
+        step("读取资讯", True, f"池子{len(tips_all)}条 / 今日取{len(tips_today)}条",
+             int((time.perf_counter() - t0) * 1000))
+    except Exception as e:
+        step("读取资讯", False, str(e))
+        log["errors"].append(f"tips: {e}")
+
+    # 5. 生成 HTML
     t0 = time.perf_counter()
     date_str = today.strftime("%Y-%m-%d")
     out_path = os.path.join(OUT, f"早报_{date_str}.html")
@@ -163,6 +201,10 @@ def main():
         f"<li>【{d['重要度']}】{d['事项']} —— 还剩 <b>{d['剩余天数']}</b> 天（{d['截止日期']}）</li>"
         for d in near_ddl) or "<li>近 7 天没有 DDL，放松～</li>")
 
+    tips_html = ("".join(
+        f"<li>【{t.get('类型', '')}】{t['内容']}</li>" for t in tips_today)
+        or "<li>今日资讯待补充（data/tips.csv）</li>")
+
     html = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <title>校园早报 {date_str}</title><style>
 body{{font-family:'Microsoft YaHei';max-width:640px;margin:24px auto;padding:0 16px;color:#222}}
@@ -177,6 +219,7 @@ footer{{color:#999;font-size:12px;text-align:center}}
 <div class="card"><h2>🌤 今日天气（{config.CITY_NAME}）</h2><p>{weather}</p></div>
 <div class="card"><h2>📚 今日课程</h2><table>{rows(courses)}</table></div>
 <div class="card"><h2>⏰ 临近截止（{config.DDL_DAYS}天内）</h2><ul>{ddl_html}</ul></div>
+<div class="card"><h2>📰 校园资讯 &amp; 生活贴士</h2><ul>{tips_html}</ul></div>
 <div class="card"><h2>📖 明天预告</h2><table>{rows(tomorrow)}</table></div>
 <footer>生成时间 {datetime.now().strftime('%H:%M:%S')} · 早报机器人 {VERSION}</footer>
 </body></html>"""
