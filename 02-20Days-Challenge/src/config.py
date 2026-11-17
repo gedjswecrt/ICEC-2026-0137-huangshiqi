@@ -10,3 +10,6 @@ LON = 114.25
 
 # 每天提醒的临近 DDL 天数窗口
 DDL_DAYS = 7
+
+# 学校官网「通知公告」栏目（v0.4 新增，由 src/campus_news.py 抓取）
+CAMPUS_NOTICE_URL = "https://www.ssti.net.cn/html/tzgg/index.html"

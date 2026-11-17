@@ -21,6 +21,7 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
+import campus_news
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA = os.path.join(BASE, "data")
@@ -29,7 +30,7 @@ LOGS = os.path.join(BASE, "process_logs")
 os.makedirs(OUT, exist_ok=True)
 os.makedirs(LOGS, exist_ok=True)
 
-VERSION = "v0.3"
+VERSION = "v0.4"
 WEEK_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
@@ -185,25 +186,68 @@ def main():
         step("读取资讯", False, str(e))
         log["errors"].append(f"tips: {e}")
 
-    # 5. 生成 HTML
+    # 5. 学校官网通知（v0.4 新增，响应用户需求：官网信息自动爬取）
+    try:
+        notices, cost = campus_news.fetch_notices(limit=5)
+        log["api_calls"] += 1
+        step("官网通知", True, f"抓到{len(notices)}条，最新 {notices[0]['date']}", cost)
+    except Exception as e:
+        notices = []
+        step("官网通知", False, f"抓取失败，早报降级生成：{e}")
+        log["errors"].append(f"notice: {e}")
+
+    # 6. 生成 HTML
     t0 = time.perf_counter()
     date_str = today.strftime("%Y-%m-%d")
     out_path = os.path.join(OUT, f"早报_{date_str}.html")
 
-    def rows(cs):
+    def rows(cs, mark_status=False):
         if not cs:
             return "<p>今天没有课，好好休息或抓紧 DDL 🙂</p>"
-        return "".join(
-            f"<tr><td>{c['开始']}-{c['结束']}</td><td>{c['课程']}</td><td>{c['地点']}</td></tr>"
-            for c in cs)
+        now = datetime.now().time()
+        out = []
+        for c in cs:
+            status = ""
+            if mark_status:  # v0.4：给今天的课加"进行中/已结束/未开始"标记（U03 反馈）
+                try:
+                    st = datetime.strptime(c["开始"], "%H:%M").time()
+                    et = datetime.strptime(c["结束"], "%H:%M").time()
+                    if now < st:
+                        status = '<span class="tag st-todo">未开始</span>'
+                    elif now <= et:
+                        status = '<span class="tag st-now">进行中</span>'
+                    else:
+                        status = '<span class="tag st-done">已结束</span>'
+                except ValueError:
+                    status = ""
+            out.append(f"<tr><td>{c['开始']}-{c['结束']}</td>"
+                       f"<td>{c['课程']}{status}</td><td>{c['地点']}</td></tr>")
+        return "".join(out)
 
-    ddl_html = ("".join(
-        f"<li>【{d['重要度']}】{d['事项']} —— 还剩 <b>{d['剩余天数']}</b> 天（{d['截止日期']}）</li>"
-        for d in near_ddl) or "<li>近 7 天没有 DDL，放松～</li>")
+    # v0.4：DDL 文案歧义修复 + 紧急高亮（U03 反馈：还剩0天看不懂、重点不突出）
+    def ddl_item(d):
+        n = d["剩余天数"]
+        if n == 0:
+            word = "今天截止！"
+        elif n == 1:
+            word = "明天截止"
+        else:
+            word = f"还剩 {n} 天"
+        cls = ' class="ddl-urgent"' if n <= 3 else ""
+        return (f'<li{cls}>【{d["重要度"]}】{d["事项"]} —— '
+                f'<b>{word}</b>（{d["截止日期"]}）</li>')
+
+    ddl_html = "".join(ddl_item(d) for d in near_ddl) or "<li>近 7 天没有 DDL，放松～</li>"
+
+    notice_html = ("".join(
+        f'<li><span class="ndate">{n_["date"]}</span>'
+        f'<a href="{n_["url"]}" target="_blank">{n_["title"]}</a></li>'
+        for n_ in notices)
+        or "<li>今日未获取到（官网暂时无法访问，不影响其余板块）</li>")
 
     tips_html = ("".join(
         f"<li>【{t.get('类型', '')}】{t['内容']}</li>" for t in tips_today)
-        or "<li>今日资讯待补充（data/tips.csv）</li>")
+        or "<li>今日贴士待补充（data/tips.csv）</li>")
 
     html = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <title>校园早报 {date_str}</title><style>
@@ -213,13 +257,21 @@ h1{{color:#1a5fb4;border-bottom:3px solid #1a5fb4;padding-bottom:8px}}
 .card h2{{margin:0 0 10px;font-size:17px;color:#1a5fb4}}
 table{{border-collapse:collapse;width:100%}} td{{border-bottom:1px solid #ddd;padding:7px 6px}}
 .badge{{display:inline-block;background:#1a5fb4;color:#fff;border-radius:6px;padding:2px 10px;font-size:13px}}
+ul{{padding-left:20px;margin:6px 0}} li{{margin:5px 0;line-height:1.5}}
+.ddl-urgent{{color:#c0392b;font-weight:bold}}
+.ddl-urgent b{{background:#fdecea;padding:1px 6px;border-radius:4px}}
+.tag{{display:inline-block;border-radius:4px;padding:1px 8px;font-size:12px;margin-left:8px;vertical-align:middle}}
+.st-now{{background:#e67e22;color:#fff}} .st-done{{background:#e0e0e0;color:#888}} .st-todo{{background:#eaf2fb;color:#1a5fb4}}
+.notice li{{margin:7px 0}} .ndate{{color:#999;font-size:12px;margin-right:8px}}
+.notice a{{color:#1a5fb4;text-decoration:none}}
 footer{{color:#999;font-size:12px;text-align:center}}
 </style></head><body>
 <h1>校园早报 <span class="badge">{date_str} {WEEK_CN[week_idx]}</span></h1>
 <div class="card"><h2>🌤 今日天气（{config.CITY_NAME}）</h2><p>{weather}</p></div>
-<div class="card"><h2>📚 今日课程</h2><table>{rows(courses)}</table></div>
+<div class="card"><h2>📚 今日课程</h2><table>{rows(courses, mark_status=True)}</table></div>
 <div class="card"><h2>⏰ 临近截止（{config.DDL_DAYS}天内）</h2><ul>{ddl_html}</ul></div>
-<div class="card"><h2>📰 校园资讯 &amp; 生活贴士</h2><ul>{tips_html}</ul></div>
+<div class="card"><h2>🏫 学校官网通知</h2><ul class="notice">{notice_html}</ul></div>
+<div class="card"><h2>💡 生活贴士</h2><ul>{tips_html}</ul></div>
 <div class="card"><h2>📖 明天预告</h2><table>{rows(tomorrow)}</table></div>
 <footer>生成时间 {datetime.now().strftime('%H:%M:%S')} · 早报机器人 {VERSION}</footer>
 </body></html>"""
