@@ -11,6 +11,7 @@
 
 运行：python src/daily_brief.py
 """
+import base64
 import csv
 import json
 import os
@@ -30,8 +31,19 @@ LOGS = os.path.join(BASE, "process_logs")
 os.makedirs(OUT, exist_ok=True)
 os.makedirs(LOGS, exist_ok=True)
 
-VERSION = "v0.4"
+VERSION = "v0.5"
 WEEK_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo.png")
+
+
+def logo_data_uri():
+    """把校徽读成 base64 data URI 内嵌进 HTML（U05 反馈：加校徽）
+    内嵌的好处：早报是单个 HTML 文件，转发到群里也能显示校徽，不依赖外部图片链接。"""
+    try:
+        with open(LOGO_PATH, "rb") as f:
+            return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
+    except OSError:
+        return ""  # 缺图不影响早报生成，只是不显示校徽
 
 
 def load_csv(path):
@@ -129,6 +141,9 @@ def main():
         print(("✅" if ok else "❌"), name, detail)
 
     today = datetime.now()
+    # 算剩余天数要用"今天零点"而非"当前时刻"：否则 22:00 运行时会比截止日少算大半天，
+    # 导致"今天截止"被算成已过期、"后天截止"被写成"明天截止"（v0.5 修复）
+    today0 = today.replace(hour=0, minute=0, second=0, microsecond=0)
     week_idx = today.weekday()          # 0=周一
     tomorrow_idx = (week_idx + 1) % 7
 
@@ -151,7 +166,7 @@ def main():
     near_ddl = []
     try:
         for d in load_csv(os.path.join(DATA, "ddl.csv")):
-            delta = (datetime.strptime(d["截止日期"], "%Y-%m-%d") - today).days
+            delta = (datetime.strptime(d["截止日期"], "%Y-%m-%d") - today0).days
             if 0 <= delta <= config.DDL_DAYS:
                 near_ddl.append({**d, "剩余天数": delta})
         near_ddl.sort(key=lambda x: x["剩余天数"])
@@ -220,8 +235,9 @@ def main():
                         status = '<span class="tag st-done">已结束</span>'
                 except ValueError:
                     status = ""
-            out.append(f"<tr><td>{c['开始']}-{c['结束']}</td>"
-                       f"<td>{c['课程']}{status}</td><td>{c['地点']}</td></tr>")
+            out.append(f"<tr><td class=\"time\">{c['开始']}-{c['结束']}</td>"
+                       f"<td>{c['课程']}{status}</td>"
+                       f"<td class=\"room\">{c['地点']}</td></tr>")
         return "".join(out)
 
     # v0.4：DDL 文案歧义修复 + 紧急高亮（U03 反馈：还剩0天看不懂、重点不突出）
@@ -239,6 +255,40 @@ def main():
 
     ddl_html = "".join(ddl_item(d) for d in near_ddl) or "<li>近 7 天没有 DDL，放松～</li>"
 
+    # v0.5：今日一句话（U04 反馈"打开就知道今天做什么、明天准备什么"的最小实现）
+    # 全部由当天课表与 DDL 实时拼出，不含任何写死的内容
+    def to_time(s):
+        return datetime.strptime(s.strip(), "%H:%M").time()
+
+    def headline():
+        now_t = datetime.now().time()
+        parts = []
+        try:
+            current = next((c for c in courses
+                            if to_time(c["开始"]) <= now_t <= to_time(c["结束"])), None)
+            nxt = next((c for c in courses if to_time(c["开始"]) > now_t), None)
+            if current:
+                parts.append(f"正在上《{current['课程']}》（{current['地点']}，{current['结束']} 下课）")
+            elif nxt:
+                parts.append(f"下一节《{nxt['课程']}》{nxt['开始']} 开始（{nxt['地点']}）")
+            elif courses:
+                parts.append("今天的课已经上完了")
+            else:
+                parts.append("今天没有课")
+        except (ValueError, KeyError):
+            parts.append("课表解析异常，请看下方课程表")
+
+        if near_ddl:
+            d = near_ddl[0]
+            n = d["剩余天数"]
+            when = "今天截止" if n == 0 else ("明天截止" if n == 1 else f"还剩 {n} 天")
+            parts.append(f"最紧的是《{d['事项']}》，{when}")
+        else:
+            parts.append("近 7 天没有 DDL")
+        return "；".join(parts) + "。"
+
+    head_line = headline()
+
     notice_html = ("".join(
         f'<li><span class="ndate">{n_["date"]}</span>'
         f'<a href="{n_["url"]}" target="_blank">{n_["title"]}</a></li>'
@@ -249,24 +299,51 @@ def main():
         f"<li>【{t.get('类型', '')}】{t['内容']}</li>" for t in tips_today)
         or "<li>今日贴士待补充（data/tips.csv）</li>")
 
+    logo_uri = logo_data_uri()
+    logo_html = f'<img class="logo" src="{logo_uri}" alt="校徽">' if logo_uri else ""
+
     html = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>校园早报 {date_str}</title><style>
-body{{font-family:'Microsoft YaHei';max-width:640px;margin:24px auto;padding:0 16px;color:#222}}
-h1{{color:#1a5fb4;border-bottom:3px solid #1a5fb4;padding-bottom:8px}}
-.card{{background:#f6f8fa;border-radius:10px;padding:16px 20px;margin:14px 0}}
-.card h2{{margin:0 0 10px;font-size:17px;color:#1a5fb4}}
-table{{border-collapse:collapse;width:100%}} td{{border-bottom:1px solid #ddd;padding:7px 6px}}
-.badge{{display:inline-block;background:#1a5fb4;color:#fff;border-radius:6px;padding:2px 10px;font-size:13px}}
-ul{{padding-left:20px;margin:6px 0}} li{{margin:5px 0;line-height:1.5}}
-.ddl-urgent{{color:#c0392b;font-weight:bold}}
-.ddl-urgent b{{background:#fdecea;padding:1px 6px;border-radius:4px}}
+:root{{--bg:#eef2f7;--card:#fff;--text:#1f2328;--muted:#6b7280;--brand:#0b3d75;--soft:#e8f0fa;--line:#e3e8ef;--urgent:#c0392b;--urgentbg:#fdecea}}
+@media (prefers-color-scheme:dark){{
+  :root{{--bg:#14181d;--card:#1c2127;--text:#e6e8eb;--muted:#9aa4af;--brand:#7fb2ea;--soft:#22303f;--line:#2b3138;--urgent:#ff7b6b;--urgentbg:#3a1f1c}}
+}}
+*{{box-sizing:border-box}}
+body{{font-family:'Microsoft YaHei','PingFang SC',sans-serif;max-width:680px;margin:22px auto;padding:0 16px;background:var(--bg);color:var(--text);line-height:1.6}}
+.brand{{display:flex;align-items:center;gap:14px;background:linear-gradient(135deg,#0d4a9e,#062a5a);border-radius:14px;padding:18px 20px;margin-bottom:16px;box-shadow:0 6px 18px rgba(6,42,90,.22)}}
+.logo{{height:32px;width:auto;display:block}}
+.brand h1{{font-size:20px;margin:0;color:#fff;letter-spacing:1px;font-weight:600}}
+.brand .date{{font-size:13px;color:#c9dcf5}}
+.headline{{background:var(--soft);border-left:4px solid var(--brand);border-radius:8px;padding:12px 15px;margin:0 0 14px;font-size:15px;color:var(--text)}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 20px;margin:13px 0;box-shadow:0 1px 3px rgba(16,24,40,.06)}}
+.card h2{{margin:0 0 11px;font-size:16px;color:var(--brand);font-weight:600}}
+table{{border-collapse:collapse;width:100%}}
+td{{border-bottom:1px solid var(--line);padding:8px 6px;font-size:15px;vertical-align:middle}}
+tr:last-child td{{border-bottom:none}}
+td.time{{color:var(--muted);white-space:nowrap;font-size:14px;width:96px}}
+td.room{{color:var(--muted);font-size:14px;text-align:right;white-space:nowrap}}
+.badge{{display:inline-block;background:var(--soft);color:var(--brand);border-radius:6px;padding:2px 10px;font-size:13px;font-weight:600}}
+ul{{padding-left:20px;margin:6px 0}} li{{margin:6px 0;line-height:1.55}}
+.ddl-urgent{{color:var(--urgent);font-weight:700}}
+.ddl-urgent b{{background:var(--urgentbg);padding:1px 6px;border-radius:4px}}
 .tag{{display:inline-block;border-radius:4px;padding:1px 8px;font-size:12px;margin-left:8px;vertical-align:middle}}
-.st-now{{background:#e67e22;color:#fff}} .st-done{{background:#e0e0e0;color:#888}} .st-todo{{background:#eaf2fb;color:#1a5fb4}}
-.notice li{{margin:7px 0}} .ndate{{color:#999;font-size:12px;margin-right:8px}}
-.notice a{{color:#1a5fb4;text-decoration:none}}
-footer{{color:#999;font-size:12px;text-align:center}}
+.st-now{{background:#e67e22;color:#fff}} .st-done{{background:var(--soft);color:var(--muted)}} .st-todo{{background:var(--soft);color:var(--brand)}}
+.notice li{{margin:8px 0}} .ndate{{color:var(--muted);font-size:12px;margin-right:8px}}
+.notice a{{color:var(--brand);text-decoration:none}}
+.notice a:hover{{text-decoration:underline}}
+footer{{color:var(--muted);font-size:12px;text-align:center;margin:22px 0 10px}}
+@media (max-width:480px){{
+  body{{margin:10px auto;padding:0 10px}}
+  .brand{{padding:14px 15px;border-radius:11px}} .logo{{height:26px}} .brand h1{{font-size:17px}}
+  .card{{padding:13px 14px;border-radius:10px;margin:10px 0}}
+  .headline{{font-size:14px;padding:10px 12px;margin-bottom:11px}}
+  td{{font-size:14px;padding:7px 3px}} td.time{{width:82px;font-size:13px}} td.room{{font-size:13px}}
+  ul{{padding-left:18px}}
+}}
 </style></head><body>
-<h1>校园早报 <span class="badge">{date_str} {WEEK_CN[week_idx]}</span></h1>
+<header class="brand">{logo_html}<div><h1>校园早报</h1><span class="date">{date_str} {WEEK_CN[week_idx]}</span></div></header>
+<div class="headline">🎯 {head_line}</div>
 <div class="card"><h2>🌤 今日天气（{config.CITY_NAME}）</h2><p>{weather}</p></div>
 <div class="card"><h2>📚 今日课程</h2><table>{rows(courses, mark_status=True)}</table></div>
 <div class="card"><h2>⏰ 临近截止（{config.DDL_DAYS}天内）</h2><ul>{ddl_html}</ul></div>
