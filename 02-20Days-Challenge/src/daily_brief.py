@@ -31,7 +31,7 @@ LOGS = os.path.join(BASE, "process_logs")
 os.makedirs(OUT, exist_ok=True)
 os.makedirs(LOGS, exist_ok=True)
 
-VERSION = "v0.5"
+VERSION = "v0.6"
 WEEK_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo.png")
 
@@ -240,6 +240,24 @@ def main():
                        f"<td class=\"room\">{c['地点']}</td></tr>")
         return "".join(out)
 
+    def rows_live(cs):
+        """今日课程行：状态标签由内嵌 JS 按"打开网页的时刻"实时计算（v0.6，U06 反馈）
+
+        背景：早报是早上生成的静态文件，全班同学下午打开时，v0.4/v0.5 的固定标签
+        还写着"未开始"，与实际不符。这里把起止时间写进 data-* 属性，
+        由浏览器端按用户自己设备的时间判断，并每分钟自动刷新。
+        """
+        if not cs:
+            return "<p>今天没有课，好好休息或抓紧 DDL 🙂</p>"
+        out = []
+        for c in cs:
+            out.append(
+                f'<tr><td class="time">{c["开始"]}-{c["结束"]}</td>'
+                f'<td>{c["课程"]}<span class="tag st-todo js-status" '
+                f'data-start="{c["开始"]}" data-end="{c["结束"]}">未开始</span></td>'
+                f'<td class="room">{c["地点"]}</td></tr>')
+        return "".join(out)
+
     # v0.4：DDL 文案歧义修复 + 紧急高亮（U03 反馈：还剩0天看不懂、重点不突出）
     def ddl_item(d):
         n = d["剩余天数"]
@@ -288,6 +306,8 @@ def main():
         return "；".join(parts) + "。"
 
     head_line = headline()
+    # 拆成"课程部分 + DDL 部分"：课程部分由页面 JS 按打开时刻重算，DDL 部分生成即定
+    head_tail = head_line.split("；", 1)[1] if "；" in head_line else "近 7 天没有 DDL。"
 
     notice_html = ("".join(
         f'<li><span class="ndate">{n_["date"]}</span>'
@@ -343,14 +363,70 @@ footer{{color:var(--muted);font-size:12px;text-align:center;margin:22px 0 10px}}
 }}
 </style></head><body>
 <header class="brand">{logo_html}<div><h1>校园早报</h1><span class="date">{date_str} {WEEK_CN[week_idx]}</span></div></header>
-<div class="headline">🎯 {head_line}</div>
+<div class="headline" id="headline" data-tail="{head_tail}">🎯 {head_line}</div>
 <div class="card"><h2>🌤 今日天气（{config.CITY_NAME}）</h2><p>{weather}</p></div>
-<div class="card"><h2>📚 今日课程</h2><table>{rows(courses, mark_status=True)}</table></div>
+<div class="card"><h2>📚 今日课程</h2><table>{rows_live(courses)}</table></div>
 <div class="card"><h2>⏰ 临近截止（{config.DDL_DAYS}天内）</h2><ul>{ddl_html}</ul></div>
 <div class="card"><h2>🏫 学校官网通知</h2><ul class="notice">{notice_html}</ul></div>
 <div class="card"><h2>💡 生活贴士</h2><ul>{tips_html}</ul></div>
 <div class="card"><h2>📖 明天预告</h2><table>{rows(tomorrow)}</table></div>
-<footer>生成时间 {datetime.now().strftime('%H:%M:%S')} · 早报机器人 {VERSION}</footer>
+<footer>生成时间 {datetime.now().strftime('%H:%M:%S')} · 阅读于 <span id="read-at">--:--</span> · 早报机器人 {VERSION}</footer>
+<script>
+// v0.6：状态标签与今日一句话按"打开网页的时刻"实时计算（U06 反馈）
+// 早报是早上生成的静态文件，同学下午/晚上打开时，标签不应停留在早上的状态。
+(function () {{
+  var tagText = {{todo: '未开始', now: '进行中', done: '已结束'}};
+  var hhmm = function (t) {{
+    var p = (t || '').split(':');
+    return p.length === 2 ? parseInt(p[0], 10) * 60 + parseInt(p[1], 10) : null;
+  }};
+  var courses = [];
+  document.querySelectorAll('.js-status').forEach(function (el) {{
+    var s = hhmm(el.dataset.start), e = hhmm(el.dataset.end);
+    if (s !== null && e !== null) {{
+      courses.push({{s: s, e: e, name: el.closest('td').textContent.trim().replace(/未开始|进行中|已结束$/, ''), room: el.closest('tr').querySelector('.room').textContent.trim()}});
+    }}
+  }});
+
+  function refresh() {{
+    var d = new Date();
+    var now = d.getHours() * 60 + d.getMinutes();
+    document.getElementById('read-at').textContent =
+      ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+
+    // 1) 每节课的状态标签
+    document.querySelectorAll('.js-status').forEach(function (el) {{
+      var s = hhmm(el.dataset.start), e = hhmm(el.dataset.end);
+      if (s === null || e === null) return;
+      var st = now < s ? 'todo' : (now <= e ? 'now' : 'done');
+      el.className = 'tag js-status st-' + st;
+      el.textContent = tagText[st];
+    }});
+
+    // 2) 今日一句话：课程部分按当前时刻重算，DDL 部分沿用生成时的结论
+    var cur = null, nxt = null;
+    for (var i = 0; i < courses.length; i++) {{
+      var c = courses[i];
+      if (cur === null && now >= c.s && now <= c.e) cur = c;
+      if (nxt === null && now < c.s) nxt = c;
+    }}
+    var part;
+    if (cur) part = '正在上《' + cur.name + '》（' + cur.room + '，' + fmt(cur.e) + ' 下课）';
+    else if (nxt) part = '下一节《' + nxt.name + '》' + fmt(nxt.s) + ' 开始（' + nxt.room + '）';
+    else if (courses.length) part = '今天的课已经上完了';
+    else part = '今天没有课';
+    var el = document.getElementById('headline');
+    if (el) el.innerHTML = '🎯 ' + part + '；' + el.dataset.tail;
+  }}
+
+  function fmt(m) {{
+    return ('0' + Math.floor(m / 60)).slice(-2) + ':' + ('0' + (m % 60)).slice(-2);
+  }}
+
+  refresh();
+  setInterval(refresh, 60000);   // 每分钟自动刷新一次，页面挂着也不会过期
+}})();
+</script>
 </body></html>"""
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
