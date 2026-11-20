@@ -4,7 +4,8 @@
 修改 CITY 的经纬度可以换城市（查经纬度：https://www.latlong.net/）
 """
 # 城市经纬度（深圳龙岗（Longgang），wttr.in 查询用 Shenzhen；换成你学校所在城市）
-CITY_NAME = "Shenzhen"
+CITY_NAME = "Shenzhen"   # 传给天气接口的名字，需英文
+CITY_CN = "深圳"          # 早报上显示的名字，v0.7 起与接口名分开
 LAT = 22.72
 LON = 114.25
 

@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-每日校园早报生成器 v0.1
+每日校园早报生成器 v0.7
 ========================
 每天自动运行一次：
   1. 读取课程表 schedule.csv，筛出今天/明天的课
   2. 读取 DDL 列表 ddl.csv，筛出临近事项
-  3. 调用 Open-Meteo 免费天气 API 拿今日天气
+  3. 调用天气 API 拿今日天气 + 今明两天气温（降温时出提醒）
   4. 生成 output/早报_YYYY-MM-DD.html
   5. 把本次运行的完整遥测日志写入 process_logs/（JSONL）
 
@@ -31,7 +31,7 @@ LOGS = os.path.join(BASE, "process_logs")
 os.makedirs(OUT, exist_ok=True)
 os.makedirs(LOGS, exist_ok=True)
 
-VERSION = "v0.6"
+VERSION = "v0.7"
 WEEK_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo.png")
 
@@ -84,8 +84,12 @@ def weather_cn(desc_en):
 
 def fetch_weather():
     """
-    获取当前天气，返回 (描述, 耗时ms, 数据源)。
+    获取当前天气 + 今明两天气温，返回 (结果dict, 耗时ms, 数据源)。
+
     主源 wttr.in（国内可达），备源 open-meteo（校园网下曾超时，保留作冗余）。
+    v0.7 起额外带回 today_min/today_max/tmr_min/tmr_max，用于判断是否降温
+    （U08 反馈：降温了多穿衣服）。两个源都能拿到，缺任何一个就退化为不做提醒，
+    绝不因为拿不到预报而让早报生成失败。
     """
     errors = []
     # 主源：wttr.in
@@ -104,7 +108,21 @@ def fetch_weather():
         if untranslated:
             # 记录翻译盲区，供后续补全映射表（不视为运行错误）
             desc += f"（原文: {desc_en}）"
-        return desc, cost_ms, "wttr.in"
+
+        def to_int(v):
+            try:
+                return int(round(float(v)))
+            except (TypeError, ValueError):
+                return None
+
+        days = raw.get("weather") or []
+        tmin_t = to_int(days[0].get("mintempC")) if len(days) > 0 else None
+        tmax_t = to_int(days[0].get("maxtempC")) if len(days) > 0 else None
+        tmin_m = to_int(days[1].get("mintempC")) if len(days) > 1 else None
+        tmax_m = to_int(days[1].get("maxtempC")) if len(days) > 1 else None
+
+        return ({"desc": desc, "tmin_today": tmin_t, "tmax_today": tmax_t,
+                 "tmin_tmr": tmin_m, "tmax_tmr": tmax_m}, cost_ms, "wttr.in")
     except Exception as e:
         errors.append(f"wttr.in: {e}")
     # 备源：open-meteo
@@ -113,6 +131,7 @@ def fetch_weather():
         url = (f"https://api.open-meteo.com/v1/forecast"
                f"?latitude={config.LAT}&longitude={config.LON}"
                f"&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m"
+               f"&daily=temperature_2m_max,temperature_2m_min&forecast_days=2"
                f"&timezone=Asia%2FShanghai")
         with urllib.request.urlopen(url, timeout=15) as r:
             raw = json.loads(r.read().decode("utf-8"))
@@ -124,10 +143,55 @@ def fetch_weather():
         desc = (f"{codes.get(cur['weather_code'], '天气码' + str(cur['weather_code']))}，"
                 f"{cur['temperature_2m']}°C，湿度{cur['relative_humidity_2m']}%，"
                 f"风速{cur['wind_speed_10m']}km/h")
-        return desc, cost_ms, "open-meteo"
+
+        def pick(key, idx):
+            try:
+                arr = raw["daily"][key]
+                v = arr[idx]
+                return None if v is None else int(round(float(v)))
+            except (KeyError, IndexError, TypeError, ValueError):
+                return None
+
+        return ({"desc": desc,
+                 "tmin_today": pick("temperature_2m_min", 0),
+                 "tmax_today": pick("temperature_2m_max", 0),
+                 "tmin_tmr": pick("temperature_2m_min", 1),
+                 "tmax_tmr": pick("temperature_2m_max", 1)},
+                cost_ms, "open-meteo")
     except Exception as e:
         errors.append(f"open-meteo: {e}")
     raise RuntimeError("; ".join(errors))
+
+
+# v0.7：降温判定阈值。次日最低气温比今天低这么多度才算"真的降温"，
+# 避免每天都弹一句"注意保暖"变成噪音（U08 反馈的落地方式）
+COOL_DROP_C = 4
+
+
+def cool_alert(w):
+    """返回降温提醒文案，不需要提醒时返回空字符串。
+
+    判定用两条线，任一成立即提醒：
+      · 最低气温：明天最低比今天最低低 >= COOL_DROP_C 度 → 早晚明显更冷
+      · 最高气温：明天最高比今天最高低 >= COOL_DROP_C 度 → 白天也整体转凉
+    只差一两度属于正常波动，不打扰。
+    """
+    if not w:
+        return ""
+    pairs = [(w.get("tmin_today"), w.get("tmin_tmr"), "最低"),
+             (w.get("tmax_today"), w.get("tmax_tmr"), "最高")]
+    best = None
+    for today_v, tmr_v, label in pairs:
+        if today_v is None or tmr_v is None:
+            continue
+        drop = today_v - tmr_v
+        if drop >= COOL_DROP_C and (best is None or drop > best[0]):
+            best = (drop, tmr_v, label)
+    if not best:
+        return ""
+    drop, tmr_v, label = best
+    # 上一行已经常驻显示了"明天 X~Y°C"，这里只补"降了多少 + 该做什么"，避免重复
+    return f"明天{label}比今天低 {drop}°C，记得添件衣服。"
 
 
 def main():
@@ -177,14 +241,36 @@ def main():
         log["errors"].append(f"ddl: {e}")
 
     # 3. 天气 API
+    weather_info = None
     try:
-        weather, cost, source = fetch_weather()
+        w, cost, source = fetch_weather()
+        weather_info = w
+        weather = w["desc"]
         log["api_calls"] += 1
         step("天气API", True, f"{weather}（数据源 {source}）", cost)
     except Exception as e:
         weather, cost = "API 获取失败（不影响早报生成）", 0
         step("天气API", False, str(e), cost)
         log["errors"].append(f"weather: {e}")
+
+    # 3b. 降温判定（v0.7，U08 反馈：降温了多穿衣服）
+    # 判定过程写进日志，方便回看"某天为什么没弹提醒"——阈值是 4°C，不是凭感觉
+    cool_msg = cool_alert(weather_info)
+    if weather_info and weather_info.get("tmin_tmr") is not None:
+        tt, tm = weather_info.get("tmin_today"), weather_info.get("tmin_tmr")
+        detail = (f"触发：{cool_msg}（今最低{tt}°C → 明最低{tm}°C）" if cool_msg
+                  else f"未触发（今最低{tt}°C / 明最低{tm}°C，降幅需≥{COOL_DROP_C}°C）")
+        step("降温判定", True, detail)
+    else:
+        step("降温判定", True, "预报温度不可用，跳过（不影响早报）")
+    # 常驻显示"明天多少度"：不降温的日子里，读者仍能看到明天的气温范围，
+    # 也能看出这个板块是"有数据在算"的，而不是空着。只有真降温才追加提醒。
+    tmr_range = ""
+    if weather_info and weather_info.get("tmin_tmr") is not None \
+            and weather_info.get("tmax_tmr") is not None:
+        tmr_range = (f'<span class="tmr">· 明天 '
+                     f'{weather_info["tmin_tmr"]}~{weather_info["tmax_tmr"]}°C</span>')
+    cool_html = f'<p class="cool-tip">🧥 {cool_msg}</p>' if cool_msg else ""
 
     # 4. 校园资讯/生活贴士（按日期轮换，同一天固定、每天不同；响应用户反馈 U01/U02）
     t0 = time.perf_counter()
@@ -325,9 +411,9 @@ def main():
     html = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>校园早报 {date_str}</title><style>
-:root{{--bg:#eef2f7;--card:#fff;--text:#1f2328;--muted:#6b7280;--brand:#0b3d75;--soft:#e8f0fa;--line:#e3e8ef;--urgent:#c0392b;--urgentbg:#fdecea}}
+:root{{--bg:#eef2f7;--card:#fff;--text:#1f2328;--muted:#6b7280;--brand:#0b3d75;--soft:#e8f0fa;--line:#e3e8ef;--urgent:#c0392b;--urgentbg:#fdecea;--coolbg:#e6f1fb;--coolfg:#0b3d75}}
 @media (prefers-color-scheme:dark){{
-  :root{{--bg:#14181d;--card:#1c2127;--text:#e6e8eb;--muted:#9aa4af;--brand:#7fb2ea;--soft:#22303f;--line:#2b3138;--urgent:#ff7b6b;--urgentbg:#3a1f1c}}
+  :root{{--bg:#14181d;--card:#1c2127;--text:#e6e8eb;--muted:#9aa4af;--brand:#7fb2ea;--soft:#22303f;--line:#2b3138;--urgent:#ff7b6b;--urgentbg:#3a1f1c;--coolbg:#1e3040;--coolfg:#9ecbff}}
 }}
 *{{box-sizing:border-box}}
 body{{font-family:'Microsoft YaHei','PingFang SC',sans-serif;max-width:680px;margin:22px auto;padding:0 16px;background:var(--bg);color:var(--text);line-height:1.6}}
@@ -350,6 +436,8 @@ ul{{padding-left:20px;margin:6px 0}} li{{margin:6px 0;line-height:1.55}}
 .tag{{display:inline-block;border-radius:4px;padding:1px 8px;font-size:12px;margin-left:8px;vertical-align:middle}}
 .st-now{{background:#e67e22;color:#fff}} .st-done{{background:var(--soft);color:var(--muted)}} .st-todo{{background:var(--soft);color:var(--brand)}}
 .notice li{{margin:8px 0}} .ndate{{color:var(--muted);font-size:12px;margin-right:8px}}
+.cool-tip{{margin:10px 0 0;padding:9px 12px;border-radius:8px;background:var(--coolbg);color:var(--coolfg);font-size:14px;font-weight:600}}
+.tmr{{color:var(--muted);font-size:14px}}
 .notice a{{color:var(--brand);text-decoration:none}}
 .notice a:hover{{text-decoration:underline}}
 footer{{color:var(--muted);font-size:12px;text-align:center;margin:22px 0 10px}}
@@ -364,7 +452,7 @@ footer{{color:var(--muted);font-size:12px;text-align:center;margin:22px 0 10px}}
 </style></head><body>
 <header class="brand">{logo_html}<div><h1>校园早报</h1><span class="date">{date_str} {WEEK_CN[week_idx]}</span></div></header>
 <div class="headline" id="headline" data-tail="{head_tail}">🎯 {head_line}</div>
-<div class="card"><h2>🌤 今日天气（{config.CITY_NAME}）</h2><p>{weather}</p></div>
+<div class="card"><h2>🌤 今日天气（{config.CITY_CN}）</h2><p>{weather} {tmr_range}</p>{cool_html}</div>
 <div class="card"><h2>📚 今日课程</h2><table>{rows_live(courses)}</table></div>
 <div class="card"><h2>⏰ 临近截止（{config.DDL_DAYS}天内）</h2><ul>{ddl_html}</ul></div>
 <div class="card"><h2>🏫 学校官网通知</h2><ul class="notice">{notice_html}</ul></div>
