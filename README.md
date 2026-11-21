@@ -27,11 +27,12 @@
 
 **项目四：解决校园真实痛点的轻量化实用程序研发与日常运行日志验证**
 
-- 作品：**每日校园早报生成器** —— 每天自动生成当天的天气、课程、临近 DDL、明日预告，输出 HTML 页面供同学查看
+- 作品：**每日校园早报生成器**（最终 v0.7）—— 每天 07:30 自动生成当天的天气（双源降级 + 降温提醒）、课表实时状态、临近 DDL、官网通知、明日预告，输出单文件 HTML 供同学查看
 - 目录：[`02-20Days-Challenge/`](02-20Days-Challenge/)
 - 关键交付：
-  - 连续 7 天自动化运行日志 → [`02-20Days-Challenge/process_logs/`](02-20Days-Challenge/process_logs/)（JSONL，含时间戳、步骤耗时、报错）
-  - 基于日志的迭代记录 → [`02-20Days-Challenge/iterations/`](02-20Days-Challenge/iterations/)（含版本史 `VERSION_HISTORY.md`）
+  - **总结报告** → [`02-20Days-Challenge/REPORT.md`](02-20Days-Challenge/REPORT.md)（日志分析、6 次迭代汇总、结论）
+  - 连续 7 天自动化运行日志 → [`02-20Days-Challenge/process_logs/`](02-20Days-Challenge/process_logs/)（JSONL，22 条，含时间戳、步骤耗时、报错）
+  - 基于日志的迭代记录 → [`02-20Days-Challenge/iterations/`](02-20Days-Challenge/iterations/)（6 次，含版本史 `VERSION_HISTORY.md`）
   - 完整源码 → [`02-20Days-Challenge/src/`](02-20Days-Challenge/src/)
   - 8 位真实用户反馈 → [`02-20Days-Challenge/data/feedback.csv`](02-20Days-Challenge/data/feedback.csv) + `screenshots/`
 
